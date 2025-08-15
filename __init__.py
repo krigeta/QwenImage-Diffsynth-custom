@@ -1,501 +1,232 @@
-import gc
 import os
-import os.path as osp
 import torch
 import folder_paths
-import comfy.model_management as mm
-
-device = mm.get_torch_device()
-offload_device = mm.unet_offload_device()
-torch_dtype = torch.bfloat16
-now_dir = osp.dirname(__file__)
-aifsh_dir = osp.join(folder_paths.models_dir,"AIFSH")
-
-import random
+import comfy.utils
+import comfy.model_management
 import numpy as np
-from PIL import Image,ImageFont,ImageDraw
-from huggingface_hub import snapshot_download
-from diffsynth.pipelines.qwen_image import QwenImagePipeline, ModelConfig
+from PIL import Image
+import cv2
 
-class LoadQwenImageDiffSynthiPipe:
-
+class QwenImageControlNetLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required":{
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
-                "vae": ("VAE",),
-                "offload":("BOOLEAN",{
-                    "default":True
-                }),
-                "fp8_quantization":("BOOLEAN",{
-                    "default":False
-                }),
-            },
-            "optional":{
-                "lora_model": ("MODEL",),
-                "lora_alpha":("FLOAT",{
-                    "default":1.0
-                })
-            }
-        }
+        return {"required": {"controlnet_name": (folder_paths.get_filename_list("controlnet"), )}}
     
-    RETURN_TYPES = ("QwenImageDiffSynthiPipe",)
-    RETURN_NAMES = ("pipe",)
+    RETURN_TYPES = ("CONTROLNET",)
+    FUNCTION = "load_controlnet"
+    CATEGORY = "loaders/qwen_image"
 
-    FUNCTION = "load_pipe"
+    def load_controlnet(self, controlnet_name):
+        controlnet_path = folder_paths.get_full_path("controlnet", controlnet_name)
+        controlnet_data = comfy.utils.load_torch_file(controlnet_path)
+        
+        # Check if this is a valid Qwen-Image ControlNet
+        if not self.is_qwen_image_controlnet(controlnet_data):
+            raise RuntimeError("ERROR: Selected model is not a valid Qwen-Image ControlNet")
+        
+        # Process state dict to remove prefix if needed
+        prefix_to_remove = "pipe.blockwise_controlnet.models.0."
+        processed_data = {}
+        for k, v in controlnet_data.items():
+            if k.startswith(prefix_to_remove):
+                processed_data[k[len(prefix_to_remove):]] = v
+            else:
+                processed_data[k] = v
+                
+        return ({"name": controlnet_name, "controlnet_data": processed_data},)
 
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def load_pipe(self, model, clip, vae, offload, fp8_quantization, lora_model=None, lora_alpha=1.0):
-        # Create a custom pipeline using the loaded ComfyUI models
-        pipe = QwenImagePipeline()
+    def is_qwen_image_controlnet(self, state_dict):
+        # Check for blockwise ControlNet specific layers
+        has_add_projections = any("add_q_proj" in k for k in state_dict.keys())
+        has_blockwise_prefix = any("blockwise_controlnet" in k for k in state_dict.keys())
         
-        # Assign the loaded models to the pipeline
-        pipe.dit = model.model  # Diffusion transformer
-        pipe.text_encoder = clip.cond_stage_model  # Text encoder
-        pipe.vae = vae.first_stage_model  # VAE
+        # Should NOT have standard ControlNet layers
+        has_standard_controlnet = any("controlnet_cond_embedding" in k for k in state_dict.keys())
         
-        # Set device and dtype
-        pipe.dit.to(device, dtype=torch_dtype)
-        pipe.text_encoder.to(device, dtype=torch_dtype)
-        pipe.vae.to(device, dtype=torch_dtype)
-        
-        # Apply quantization if requested
-        if fp8_quantization:
-            if hasattr(pipe.dit, 'to'):
-                pipe.dit = pipe.dit.to(dtype=torch.float8_e4m3fn)
-            if hasattr(pipe.text_encoder, 'to'):
-                pipe.text_encoder = pipe.text_encoder.to(dtype=torch.float8_e4m3fn)
-            if hasattr(pipe.vae, 'to'):
-                pipe.vae = pipe.vae.to(dtype=torch.float8_e4m3fn)
-        
-        # Handle offloading
-        if offload:
-            # Move models to CPU when not in use
-            pipe.enable_model_cpu_offload = True
-        
-        # Apply LoRA if provided
-        if lora_model is not None:
-            # Apply LoRA to the diffusion transformer
-            pipe.dit = lora_model.model
-            # Set LoRA alpha if the model supports it
-            if hasattr(pipe.dit, 'set_lora_alpha'):
-                pipe.dit.set_lora_alpha(lora_alpha)
-        
-        # Store original models for potential CPU offloading
-        pipe._original_models = {
-            'dit': model,
-            'clip': clip, 
-            'vae': vae,
-            'lora': lora_model
-        }
-        
-        return (pipe, )
+        return has_add_projections and (has_blockwise_prefix or not has_standard_controlnet)
 
 
-class LoadQwenImageDiffSynthiPipeControlNet:
-
+class QwenImageControlNetApply:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required":{
-                "model": ("MODEL",),
-                "clip": ("CLIP",),
-                "vae": ("VAE",),
-                "controlnet": ("CONTROL_NET",),
-                "offload":("BOOLEAN",{
-                    "default":True
-                }),
-                "fp8_quantization":("BOOLEAN",{
-                    "default":False
-                }),
-            },
-            "optional":{
-                "lora_model": ("MODEL",),
-                "lora_alpha":("FLOAT",{
-                    "default":1.0
-                })
-            }
-        }
+        return {"required": {"model": ("MODEL",),
+                            "controlnet": ("CONTROLNET",),
+                            "image": ("IMAGE",),
+                            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01})}}
     
-    RETURN_TYPES = ("QwenImageDiffSynthiPipeControlNet",)
-    RETURN_NAMES = ("controlnet_pipe",)
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_controlnet"
+    CATEGORY = "model/controlnet"
 
-    FUNCTION = "load_pipe"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def load_pipe(self, model, clip, vae, controlnet, offload, fp8_quantization, lora_model=None, lora_alpha=1.0):
-        # Create a custom pipeline using the loaded ComfyUI models
-        pipe = QwenImagePipeline()
+    def apply_controlnet(self, model, controlnet, image, strength):
+        # Clone the model to avoid modifying the original
+        m = model.clone()
         
-        # Assign the loaded models to the pipeline
-        pipe.dit = model.model  # Diffusion transformer
-        pipe.text_encoder = clip.cond_stage_model  # Text encoder  
-        pipe.vae = vae.first_stage_model  # VAE
-        pipe.controlnet = controlnet.control_model  # ControlNet
+        # Process the image to get conditioning
+        conditioning = self.process_conditioning(image)
         
-        # Set device and dtype
-        pipe.dit.to(device, dtype=torch_dtype)
-        pipe.text_encoder.to(device, dtype=torch_dtype)
-        pipe.vae.to(device, dtype=torch_dtype)
-        pipe.controlnet.to(device, dtype=torch_dtype)
-        
-        # Apply quantization if requested
-        if fp8_quantization:
-            if hasattr(pipe.dit, 'to'):
-                pipe.dit = pipe.dit.to(dtype=torch.float8_e4m3fn)
-            if hasattr(pipe.text_encoder, 'to'):
-                pipe.text_encoder = pipe.text_encoder.to(dtype=torch.float8_e4m3fn)
-            if hasattr(pipe.vae, 'to'):
-                pipe.vae = pipe.vae.to(dtype=torch.float8_e4m3fn)
-            if hasattr(pipe.controlnet, 'to'):
-                pipe.controlnet = pipe.controlnet.to(dtype=torch.float8_e4m3fn)
-        
-        # Handle offloading
-        if offload:
-            pipe.enable_model_cpu_offload = True
-        
-        # Apply LoRA if provided
-        if lora_model is not None:
-            pipe.dit = lora_model.model
-            if hasattr(pipe.dit, 'set_lora_alpha'):
-                pipe.dit.set_lora_alpha(lora_alpha)
-        
-        # Store original models
-        pipe._original_models = {
-            'dit': model,
-            'clip': clip,
-            'vae': vae,
-            'controlnet': controlnet,
-            'lora': lora_model
+        # Store the conditioning for later use
+        m.model_options.setdefault("transformer_options", {})
+        m.model_options["transformer_options"]["blockwise_controlnet"] = {
+            "conditioning": conditioning,
+            "strength": strength,
+            "controlnet_data": controlnet["controlnet_data"]
         }
         
-        return (pipe, )
-
-
-class SetEligenArgs:
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required":{
-                "mask":("IMAGE",),
-                "prompt":("STRING",),
-            },
-        }
-    RETURN_TYPES = ("EligenArgs","IMAGE",)
-    RETURN_NAMES = ("eligen_args","mask",)
-
-    FUNCTION = "set_args"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def set_args(self,mask,prompt):
-        eligen_args = dict(masks=[comfy2pil(mask)],prompts=[prompt])
-        mask = visualize_masks(comfy2pil(mask),masks=eligen_args['masks'],
-                               mask_prompts=eligen_args['prompts'])
-        return (eligen_args,pil2comfy(mask),)
-
-
-class EligenArgsConcat:
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required":{
-                "a_eligen_args":("EligenArgs",),
-                "b_eligen_args":("EligenArgs",),
-            },
-            "optional":{
-                "c_eligen_args":("EligenArgs",),
-            }
-        }
-    RETURN_TYPES = ("EligenArgs","IMAGE",)
-    RETURN_NAMES = ("eligen_args","mask",)
-
-    FUNCTION = "set_args"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def set_args(self,a_eligen_args,b_eligen_args,c_eligen_args=None):
-        masks=a_eligen_args["masks"]+b_eligen_args["masks"]
-        prompts=a_eligen_args["prompts"]+b_eligen_args["prompts"]
-        if c_eligen_args is not None:
-            masks += c_eligen_args["masks"]
-            prompts += c_eligen_args["prompts"]
-        eligen_args = dict(masks=masks, prompts=prompts)
+        # Patch the attention layers
+        self.patch_attention_layers(m.model.diffusion_model)
         
-        empty_pil = Image.new("RGB",size=eligen_args['masks'][0].size,color=0)
-        mask = visualize_masks(empty_pil,masks=masks,mask_prompts=prompts)
-        
-        return (eligen_args,pil2comfy(mask),)
-
-
-class QwenImageRatio2Size:
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required":{
-                "aspect_ratio":(["1:1","16:9","9:16","4:3","3:4"],)
-            }
-        }
+        return (m,)
     
-    RETURN_TYPES = ("INT","INT",)
-    RETURN_NAMES = ("width","height",)
-
-    FUNCTION = "get_image_size"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def get_image_size(self,aspect_ratio):
-        if aspect_ratio == "1:1":
-            return (1328, 1328,)
-        elif aspect_ratio == "16:9":
-            return (1664, 928,)
-        elif aspect_ratio == "9:16":
-            return (928, 1664,)
-        elif aspect_ratio == "4:3":
-            return (1472, 1140,)
-        elif aspect_ratio == "3:4":
-            return (1140, 1472,)
-        else:
-            return (1328, 1328,)
+    def process_conditioning(self, image):
+        # Convert from ComfyUI format [B, H, W, C] to [B, C, H, W]
+        image = image.permute(0, 3, 1, 2)
+        # Scale to -1 to 1 range
+        conditioning = 2.0 * image - 1.0
+        return conditioning
+    
+    def patch_attention_layers(self, transformer):
+        # Iterate through all transformer blocks
+        for i, block in enumerate(transformer.transformer_blocks):
+            # Check if the attention layer has the required projection layers
+            if hasattr(block.attn, "add_q_proj") and hasattr(block.attn, "add_k_proj") and hasattr(block.attn, "add_v_proj"):
+                # Store the original forward method
+                if not hasattr(block.attn, "original_forward"):
+                    block.attn.original_forward = block.attn.forward
+                    
+                    # Create a patched forward method
+                    def make_patched_forward(attn_layer, block_idx):
+                        def patched_forward(hidden_states, encoder_hidden_states=None, 
+                                          encoder_hidden_states_mask=None, image_rotary_emb=None, **kwargs):
+                            # Get ControlNet data
+                            transformer_options = attn_layer.model_options.get("transformer_options", {})
+                            controlnet = transformer_options.get("blockwise_controlnet", None)
+                            
+                            # Call original forward
+                            img_attn_output, txt_attn_output = attn_layer.original_forward(
+                                hidden_states, encoder_hidden_states, 
+                                encoder_hidden_states_mask, image_rotary_emb, **kwargs
+                            )
+                            
+                            if controlnet is not None and encoder_hidden_states is not None:
+                                # Apply ControlNet conditioning
+                                conditioning = controlnet["conditioning"]
+                                strength = controlnet["strength"]
+                                controlnet_data = controlnet["controlnet_data"]
+                                
+                                # In Qwen-Image, the ControlNet is applied through the add_*_proj layers
+                                # These layers process the additional conditioning information
+                                
+                                # Get the ControlNet weights for this block
+                                q_proj_key = f"transformer_blocks.{block_idx}.attn.add_q_proj.weight"
+                                k_proj_key = f"transformer_blocks.{block_idx}.attn.add_k_proj.weight"
+                                v_proj_key = f"transformer_blocks.{block_idx}.attn.add_v_proj.weight"
+                                
+                                # Apply ControlNet conditioning if weights exist
+                                if (q_proj_key in controlnet_data and 
+                                    k_proj_key in controlnet_data and 
+                                    v_proj_key in controlnet_data):
+                                    
+                                    # Process the conditioning through the ControlNet layers
+                                    # This is where the actual ControlNet application happens
+                                    batch_size = conditioning.shape[0]
+                                    
+                                    # Reshape conditioning to match expected dimensions
+                                    cond_reshaped = conditioning.view(batch_size, conditioning.shape[1], -1).permute(0, 2, 1)
+                                    
+                                    # Apply ControlNet weights
+                                    q_cond = torch.nn.functional.linear(
+                                        cond_reshaped, 
+                                        controlnet_data[q_proj_key]
+                                    )
+                                    k_cond = torch.nn.functional.linear(
+                                        cond_reshaped, 
+                                        controlnet_data[k_proj_key]
+                                    )
+                                    v_cond = torch.nn.functional.linear(
+                                        cond_reshaped, 
+                                        controlnet_data[v_proj_key]
+                                    )
+                                    
+                                    # Apply strength scaling
+                                    q_cond = q_cond * strength
+                                    k_cond = k_cond * strength
+                                    v_cond = v_cond * strength
+                                    
+                                    # Add to the attention outputs
+                                    img_attn_output = img_attn_output + q_cond
+                                    txt_attn_output = txt_attn_output + k_cond
+                            
+                            return img_attn_output, txt_attn_output
+                        
+                        return patched_forward
+                    
+                    # Apply the patched forward method
+                    block.attn.forward = make_patched_forward(block.attn, i)
         
+        return transformer
 
-class QwenImageDiffSynthSampler:
 
+class QwenImageControlNetPreprocessor:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required":{
-                "pipe":("QwenImageDiffSynthiPipe",),
-                "prompt":("STRING",),
-                "negative_prompt":("STRING",),
-                "width":("INT",{
-                    "default":982
-                }),
-                "height":("INT",{
-                    "default":1664
-                }),
-                "num_inference_steps":("INT",{
-                    "default":30
-                }),
-                "guidance_scale":("FLOAT",{
-                    "default":4,
-                }),
-                "seed":("INT",{
-                    "default":42
-                }),
-            },
-            "optional":{
-                "eligen_args":("EligenArgs",),
-            }
-        }
+        return {"required": {"image": ("IMAGE",),
+                            "control_type": (["canny", "depth", "hed", "scribble", "none"], {"default": "canny"})}}
     
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    FUNCTION = "preprocess"
+    CATEGORY = "preprocessors/qwen_image"
 
-    FUNCTION = "sample"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def sample(self,pipe,prompt,negative_prompt,
-               width,height,num_inference_steps,
-               guidance_scale,seed,eligen_args=None):
-        if eligen_args is None:
-            eligen_args = dict(masks=None,prompts=None)
-        masks = eligen_args["masks"]
-        prompts = eligen_args["prompts"]
+    def preprocess(self, image, control_type):
+        # Convert from [B, H, W, C] to [H, W, C] for processing (take first image if batch)
+        image_np = 255. * image[0].cpu().numpy()
         
-        # Set random seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        # Apply appropriate preprocessing based on control type
+        if control_type == "canny":
+            # Apply Canny edge detection
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            result = edges / 255.0
+            # Convert back to 3 channels
+            result = np.stack([result, result, result], axis=-1)
+        elif control_type == "depth":
+            # Apply depth estimation (would require a depth model)
+            # This is simplified - in reality you'd use a depth estimation model
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            result = gray / 255.0
+            # Convert back to 3 channels
+            result = np.stack([result, result, result], axis=-1)
+        elif control_type == "hed":
+            # HED edge detection (simplified)
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+            result = edges / 255.0
+            result = np.stack([result, result, result], axis=-1)
+        elif control_type == "scribble":
+            # Convert to grayscale and invert (for scribble-like effect)
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            result = 1.0 - (gray / 255.0)
+            result = np.stack([result, result, result], axis=-1)
+        else:  # "none"
+            # Just return the original image normalized to 0-1
+            result = image_np / 255.0
         
-        image = pipe(
-            prompt=prompt,
-            cfg_scale=guidance_scale,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            height=height,
-            width=width,
-            eligen_entity_prompts=prompts,
-            eligen_entity_masks=masks,
-        )
+        # Convert back to tensor format ComfyUI expects [1, H, W, C]
+        result_tensor = torch.from_numpy(result).unsqueeze(0).float()
         
-        return (pil2comfy(image),)
+        return (result_tensor,)
 
 
-class QwenImageControlNetSampler:
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required":{
-                "controlnet_pipe":("QwenImageDiffSynthiPipeControlNet",),
-                "prompt":("STRING",),
-                "controlnet_image":("IMAGE",),
-                "width":("INT",{
-                    "default":1328
-                }),
-                "height":("INT",{
-                    "default":1328
-                }),
-                "num_inference_steps":("INT",{
-                    "default":30
-                }),
-                "guidance_scale":("FLOAT",{
-                    "default":4,
-                }),
-                "seed":("INT",{
-                    "default":42
-                }),
-            },
-            "optional":{
-                "negative_prompt":("STRING",{
-                    "default":""
-                }),
-                "controlnet_scale":("FLOAT",{
-                    "default":1.0
-                }),
-                "eligen_args":("EligenArgs",),
-            }
-        }
-    
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-
-    FUNCTION = "sample"
-
-    CATEGORY = "AIFSH/QwenImageDiffSynth"
-
-    def sample(self,controlnet_pipe,prompt,controlnet_image,
-               width,height,num_inference_steps,
-               guidance_scale,seed,negative_prompt="",
-               controlnet_scale=1.0,eligen_args=None):
-        from diffsynth.pipelines.qwen_image import ControlNetInput
-        
-        # Convert ComfyUI image to PIL
-        controlnet_pil = comfy2pil(controlnet_image).resize((width, height))
-        
-        # Prepare ControlNet input
-        controlnet_input = ControlNetInput(image=controlnet_pil, scale=controlnet_scale)
-        
-        # Prepare EliGen args if provided
-        kwargs = {}
-        if eligen_args is not None:
-            masks = eligen_args.get("masks")
-            prompts = eligen_args.get("prompts")
-            if masks and prompts:
-                kwargs["eligen_entity_prompts"] = prompts
-                kwargs["eligen_entity_masks"] = masks
-        
-        # Set random seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        
-        # Generate image
-        image = controlnet_pipe(
-            prompt=prompt,
-            cfg_scale=guidance_scale,
-            negative_prompt=negative_prompt if negative_prompt else None,
-            num_inference_steps=num_inference_steps,
-            height=height,
-            width=width,
-            blockwise_controlnet_inputs=[controlnet_input],
-            **kwargs
-        )
-        
-        return (pil2comfy(image),)
-    
-
-def comfy2pil(image):
-    i = 255. * image.cpu().numpy()[0]
-    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-    return img
-    
-def pil2comfy(pil):
-    image = np.array(pil).astype(np.float32) / 255.0
-    image = torch.from_numpy(image)[None,]
-    return image
-
-def visualize_masks(image, masks, mask_prompts,font_size=35, use_random_colors=False):
-    # Create a blank image for overlays
-    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
-
-    colors = [
-        (165, 238, 173, 80),
-        (76, 102, 221, 80),
-        (221, 160, 77, 80),
-        (204, 93, 71, 80),
-        (145, 187, 149, 80),
-        (134, 141, 172, 80),
-        (157, 137, 109, 80),
-        (153, 104, 95, 80),
-        (165, 238, 173, 80),
-        (76, 102, 221, 80),
-        (221, 160, 77, 80),
-        (204, 93, 71, 80),
-        (145, 187, 149, 80),
-        (134, 141, 172, 80),
-        (157, 137, 109, 80),
-        (153, 104, 95, 80),
-    ]
-    # Generate random colors for each mask
-    if use_random_colors:
-        colors = [(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255), 80) for _ in range(len(masks))]
-
-    # Font settings
-    try:
-        font = ImageFont.truetype(osp.join(now_dir,"font/Arial-Unicode-Regular.ttf"), font_size)  # Adjust as needed
-    except IOError:
-        font = ImageFont.load_default(font_size)
-
-    # Overlay each mask onto the overlay image
-    for mask, mask_prompt, color in zip(masks, mask_prompts, colors):
-        # Convert mask to RGBA mode
-        mask_rgba = mask.convert('RGBA')
-        mask_data = mask_rgba.getdata()
-        new_data = [(color if item[:3] == (255, 255, 255) else (0, 0, 0, 0)) for item in mask_data]
-        mask_rgba.putdata(new_data)
-
-        # Draw the mask prompt text on the mask
-        draw = ImageDraw.Draw(mask_rgba)
-        mask_bbox = mask.getbbox()  # Get the bounding box of the mask
-        if mask_bbox:  # Check if mask is not empty
-            text_position = (mask_bbox[0] + 10, mask_bbox[1] + 10)  # Adjust text position based on mask position
-            draw.text(text_position, mask_prompt, fill=(255, 255, 255, 255), font=font)
-
-        # Alpha composite the overlay with this mask
-        overlay = Image.alpha_composite(overlay, mask_rgba)
-
-    # Composite the overlay onto the original image
-    result = Image.alpha_composite(image.convert('RGBA'), overlay)
-
-    return result
-
-
+# Register the nodes with ComfyUI
 NODE_CLASS_MAPPINGS = {
-    "LoadQwenImageDiffSynthiPipe": LoadQwenImageDiffSynthiPipe,
-    "LoadQwenImageDiffSynthiPipeControlNet": LoadQwenImageDiffSynthiPipeControlNet,
-    "QwenImageDiffSynthSampler":QwenImageDiffSynthSampler,
-    "QwenImageControlNetSampler":QwenImageControlNetSampler,
-    "QwenImageRatio2Size":QwenImageRatio2Size,
-    "SetEligenArgs":SetEligenArgs,
-    "EligenArgsConcat":EligenArgsConcat,
+    "QwenImageControlNetLoader": QwenImageControlNetLoader,
+    "QwenImageControlNetApply": QwenImageControlNetApply,
+    "QwenImageControlNetPreprocessor": QwenImageControlNetPreprocessor
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LoadQwenImageDiffSynthiPipe": "LoadQwenImageDiffSynthiPipe@关注超级面爸微信公众号",
-    "LoadQwenImageDiffSynthiPipeControlNet": "LoadQwenImageDiffSynthiPipeControlNet@关注超级面爸微信公众号",
-    "QwenImageDiffSynthSampler":"QwenImageDiffSynthSampler@关注超级面爸微信公众号",
-    "QwenImageControlNetSampler":"QwenImageControlNetSampler@关注超级面爸微信公众号",
-    "QwenImageRatio2Size":"QwenImageRatio2Size@关注超级面爸微信公众号",
-    "SetEligenArgs":"SetEligenArgs@关注超级面爸微信公众号",
-    "EligenArgsConcat":"EligenArgsConcat@关注超级面爸微信公众号",
+    "QwenImageControlNetLoader": "Qwen Image ControlNet Loader",
+    "QwenImageControlNetApply": "Qwen Image ControlNet Apply",
+    "QwenImageControlNetPreprocessor": "Qwen Image ControlNet Preprocessor"
 }
